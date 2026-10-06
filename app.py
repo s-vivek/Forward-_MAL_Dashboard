@@ -1,16 +1,16 @@
 """
-Forward MAL Dashboard — Streamlit version
-Deploy free at streamlit.io/cloud
+Forward MAL Dashboard — Streamlit + Google Drive
+Data downloads automatically from Google Drive on startup.
 """
-import os, glob, warnings
+import os, glob, warnings, io, time
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import requests
 
 warnings.filterwarnings("ignore")
 
-# ── Page config ─────────────────────────────────────────────
 st.set_page_config(
     page_title="Forward MAL Dashboard",
     page_icon="🔴",
@@ -21,46 +21,93 @@ st.markdown("""
 <style>
 [data-testid="stSidebar"]{background:#1A5276}
 [data-testid="stSidebar"] *{color:#fff !important}
-[data-testid="stSidebar"] .stMultiSelect label{color:#fff !important}
-[data-testid="stSidebar"] .stSelectbox label{color:#fff !important}
 .kpi-card{background:#fff;border-radius:8px;padding:14px 16px;
           border-left:4px solid #ccc;box-shadow:0 2px 6px rgba(0,0,0,.08);text-align:center}
 </style>
 """, unsafe_allow_html=True)
 
+FOLDER_ID = "1rYrKfRRO45dbmank4fcHG81CaTS5a9x2"
 COLS = ["origin_party_id","destination_party_id","external_id",
         "updated_at","fsn","add_excess_variance_id",
         "Qty","Value","cms_vertical","DS City","Zone","Store Name","Remark"]
-
 TOP_N = 15
 
-# ── Load data ────────────────────────────────────────────────
-@st.cache_data(show_spinner="Loading files...")
-def load_data():
-    # Works both locally and on Streamlit Cloud (data folder beside app.py)
-    base = os.path.dirname(__file__)
-    folder = os.path.join(base, "csv_files")
+# ── Google Drive helpers ─────────────────────────────────────
+def gdrive_list(folder_id):
+    """List all files recursively in a public Google Drive folder."""
+    API = "https://www.googleapis.com/drive/v3/files"
+    KEY = st.secrets.get("GDRIVE_API_KEY", "")  # optional API key
+    files = []
+    queue = [folder_id]
+    while queue:
+        fid = queue.pop()
+        params = {
+            "q": f"'{fid}' in parents and trashed=false",
+            "fields": "files(id,name,mimeType)",
+            "pageSize": 1000,
+        }
+        if KEY:
+            params["key"] = KEY
+        try:
+            r = requests.get(API, params=params, timeout=30)
+            items = r.json().get("files", [])
+        except Exception:
+            items = []
+        for item in items:
+            if item["mimeType"] == "application/vnd.google-apps.folder":
+                queue.append(item["id"])
+            elif item["name"].endswith((".csv", ".xlsx")):
+                files.append(item)
+    return files
 
-    files = glob.glob(os.path.join(folder, "**", "*.csv"),  recursive=True)
+def gdrive_download(file_id):
+    """Download a file from Google Drive by file ID."""
+    url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    session = requests.Session()
+    r = session.get(url, stream=True, timeout=60)
+    # Handle large file warning page
+    for key, val in r.cookies.items():
+        if "download_warning" in key:
+            r = session.get(url, params={"confirm": val}, stream=True, timeout=120)
+            break
+    content = b""
+    for chunk in r.iter_content(chunk_size=1024*1024):
+        content += chunk
+    return content
+
+# ── Load data ────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_data():
+    status = st.empty()
+    status.info("🔄 Connecting to Google Drive...")
+
+    files = gdrive_list(FOLDER_ID)
     if not files:
-        files = glob.glob(os.path.join(folder, "**", "*.xlsx"), recursive=True)
-    if not files:
-        st.error(f"No CSV/XLSX files found in: {folder}")
+        st.error("No CSV/XLSX files found in Google Drive folder. "
+                 "Make sure the folder is shared publicly (Anyone with link).")
         st.stop()
 
+    status.info(f"🔄 Found {len(files)} file(s). Downloading... (this may take a few minutes on first load)")
     dfs = []
-    for f in files:
+    for i, f in enumerate(files, 1):
+        status.info(f"🔄 Downloading {i}/{len(files)}: {f['name']}")
         try:
-            ext = os.path.splitext(f)[1].lower()
+            content = gdrive_download(f["id"])
+            ext = os.path.splitext(f["name"])[1].lower()
             if ext == ".xlsx":
-                tmp = pd.read_excel(f, engine="openpyxl")
+                tmp = pd.read_excel(io.BytesIO(content), engine="openpyxl")
             else:
-                try:    tmp = pd.read_csv(f, encoding="utf-8",   low_memory=False)
-                except: tmp = pd.read_csv(f, encoding="latin1", low_memory=False)
+                try:    tmp = pd.read_csv(io.BytesIO(content), encoding="utf-8",   low_memory=False)
+                except: tmp = pd.read_csv(io.BytesIO(content), encoding="latin1", low_memory=False)
             existing = [c for c in COLS if c in tmp.columns]
-            dfs.append(tmp[existing])
+            if existing:
+                dfs.append(tmp[existing])
         except Exception as e:
-            st.warning(f"Skipped {os.path.basename(f)}: {e}")
+            st.warning(f"Skipped {f['name']}: {e}")
+
+    if not dfs:
+        st.error("No data loaded. Check file format and Drive permissions.")
+        st.stop()
 
     df = pd.concat(dfs, ignore_index=True)
     df = df.loc[:, ~df.columns.duplicated()]
@@ -86,6 +133,7 @@ def load_data():
         if c in df.columns:
             df[c] = df[c].fillna("Unknown").astype(str).str.strip()
 
+    status.empty()
     return df, len(files)
 
 DF, n_files = load_data()
@@ -95,31 +143,33 @@ st.sidebar.title("🔴 Forward MAL")
 st.sidebar.markdown(f"**{n_files} file(s) · {len(DF):,} records**")
 st.sidebar.markdown("---")
 
-def ms(label, col, df=DF):
-    opts = sorted(df[col].dropna().unique().tolist())
-    return st.sidebar.multiselect(label, opts, default=[])
-
-month_opts = sorted(DF["Month"].dropna().unique().tolist())
+month_opts   = sorted(DF["Month"].dropna().unique().tolist())
 month_labels = {m: DF[DF["Month"]==m]["MonthLabel"].iloc[0] for m in month_opts}
-sel_months = st.sidebar.multiselect("Month", options=month_opts,
-                                    format_func=lambda x: month_labels.get(x, x))
+sel_months   = st.sidebar.multiselect("Month", options=month_opts,
+                                      format_func=lambda x: month_labels.get(x, x))
 
-week_opts = (DF.groupby(["YearWeek","WeekLabel"]).size()
-               .reset_index().sort_values("YearWeek")["WeekLabel"].tolist())
-sel_weeks   = st.sidebar.multiselect("Week",         week_opts)
-sel_origin  = ms("Origin Party",  "origin_party_id")
-sel_dest    = ms("Dest Party",    "destination_party_id")
-sel_vert    = ms("Vertical",      "cms_vertical")
-sel_city    = ms("DS City",       "DS City")
-sel_zone    = ms("Zone",          "Zone")
-sel_store   = ms("Store Name",    "Store Name")
-sel_remark  = ms("Remark",        "Remark")
+week_opts  = (DF.groupby(["YearWeek","WeekLabel"]).size()
+                .reset_index().sort_values("YearWeek")["WeekLabel"].tolist())
+
+def ms(label, col):
+    opts = sorted(DF[col].dropna().unique().tolist())
+    return st.sidebar.multiselect(label, opts)
+
+sel_weeks  = st.sidebar.multiselect("Week", week_opts)
+sel_origin = ms("Origin Party",  "origin_party_id")
+sel_dest   = ms("Dest Party",    "destination_party_id")
+sel_vert   = ms("Vertical",      "cms_vertical")
+sel_city   = ms("DS City",       "DS City")
+sel_zone   = ms("Zone",          "Zone")
+sel_store  = ms("Store Name",    "Store Name")
+sel_remark = ms("Remark",        "Remark")
 
 st.sidebar.markdown("---")
-apply = st.sidebar.button("▶ Apply Filters", use_container_width=True, type="primary")
-reset = st.sidebar.button("✕ Reset All",     use_container_width=True)
+do_reset = st.sidebar.button("✕ Reset All", use_container_width=True)
+if do_reset:
+    st.rerun()
 
-# ── Filter logic ─────────────────────────────────────────────
+# ── Filter ───────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def filter_df(months, weeks, origins, dests, verts, cities, zones, stores, remarks):
     df = DF.copy()
@@ -134,9 +184,6 @@ def filter_df(months, weeks, origins, dests, verts, cities, zones, stores, remar
     if remarks: df = df[df["Remark"].isin(remarks)]
     return df
 
-if reset:
-    st.rerun()
-
 df = filter_df(
     tuple(sel_months), tuple(sel_weeks), tuple(sel_origin),
     tuple(sel_dest), tuple(sel_vert), tuple(sel_city),
@@ -145,7 +192,7 @@ df = filter_df(
 
 # ── Header ───────────────────────────────────────────────────
 st.title("🔴 Forward MAL Dashboard")
-st.caption(f"{n_files} file(s) loaded · {len(df):,} records shown")
+st.caption(f"{n_files} file(s) · {len(df):,} records shown")
 
 # ── KPIs ─────────────────────────────────────────────────────
 k1,k2,k3,k4,k5,k6 = st.columns(6)
@@ -156,59 +203,39 @@ def kpi(col, label, value, color):
       <div style="font-size:18px;font-weight:700;color:{color}">{value}</div>
     </div>""", unsafe_allow_html=True)
 
-kpi(k1, "Total MAL Value",  f"Rs.{df['Value'].sum():,.0f}",        "#E74C3C")
-kpi(k2, "Total MAL Qty",    f"{df['Qty'].sum():,.0f}",             "#E67E22")
-kpi(k3, "Unique SKUs",      f"{df['fsn'].nunique() if 'fsn' in df.columns else 0:,}", "#2980B9")
-kpi(k4, "Stores Affected",  f"{df['Store Name'].nunique():,}",     "#1ABC9C")
-kpi(k5, "Origin Parties",   f"{df['origin_party_id'].nunique():,}","#1A5276")
-kpi(k6, "Dest Parties",     f"{df['destination_party_id'].nunique():,}","#8E44AD")
+kpi(k1,"Total MAL Value", f"Rs.{df['Value'].sum():,.0f}",                        "#E74C3C")
+kpi(k2,"Total MAL Qty",   f"{df['Qty'].sum():,.0f}",                             "#E67E22")
+kpi(k3,"Unique SKUs",     f"{df['fsn'].nunique() if 'fsn' in df.columns else 0:,}","#2980B9")
+kpi(k4,"Stores Affected", f"{df['Store Name'].nunique():,}",                     "#1ABC9C")
+kpi(k5,"Origin Parties",  f"{df['origin_party_id'].nunique():,}",                "#1A5276")
+kpi(k6,"Dest Parties",    f"{df['destination_party_id'].nunique():,}",           "#8E44AD")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Chart helpers ─────────────────────────────────────────────
-def topn_val(col, n=TOP_N):
-    return df.groupby(col)["Value"].sum().nlargest(n).reset_index()
-
-def topn_qty(col, n=TOP_N):
-    return df.groupby(col)["Qty"].sum().nlargest(n).reset_index()
+LAYOUT = dict(plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
+              font=dict(family="Arial", size=11), showlegend=False)
 
 def hbar_val(col, title, color):
-    t = topn_val(col)
+    t = df.groupby(col)["Value"].sum().nlargest(TOP_N).reset_index().sort_values("Value")
     if t.empty: return go.Figure()
-    t = t.sort_values("Value")
     fig = px.bar(t, x="Value", y=col, orientation="h", title=title,
                  text=t["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
                  color_discrete_sequence=[color])
     fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, margin=dict(l=10,r=60,t=40,b=10),
-                      plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
+    fig.update_layout(**LAYOUT, margin=dict(l=10,r=80,t=40,b=10),
                       yaxis_title="", xaxis_title="Value (Rs.)")
     return fig
 
 def hbar_qty(col, title, color):
-    t = topn_qty(col)
+    t = df.groupby(col)["Qty"].sum().nlargest(TOP_N).reset_index().sort_values("Qty")
     if t.empty: return go.Figure()
-    t = t.sort_values("Qty")
     fig = px.bar(t, x="Qty", y=col, orientation="h", title=title,
                  text=t["Qty"].apply(lambda v: f"{v:,.0f}"),
                  color_discrete_sequence=[color])
     fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, margin=dict(l=10,r=60,t=40,b=10),
-                      plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
+    fig.update_layout(**LAYOUT, margin=dict(l=10,r=60,t=40,b=10),
                       yaxis_title="", xaxis_title="Qty")
-    return fig
-
-def vbar(groupcol, sortcol, xlabel, title, color):
-    t = df.groupby([sortcol, groupcol])["Value"].sum().reset_index().sort_values(sortcol)
-    if t.empty: return go.Figure()
-    fig = px.bar(t, x=groupcol, y="Value", title=title,
-                 text=t["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
-                 color_discrete_sequence=[color])
-    fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, margin=dict(l=10,r=10,t=40,b=80),
-                      plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
-                      xaxis_title=xlabel, yaxis_title="Value (Rs.)",
-                      xaxis_tickangle=-45)
     return fig
 
 def pie_chart(col, title):
@@ -221,40 +248,37 @@ def pie_chart(col, title):
 
 # ── Trends ────────────────────────────────────────────────────
 st.subheader("📈 Trends")
-trend_month = df.groupby(["Month","MonthLabel"])["Value"].sum().reset_index().sort_values("Month")
-fig_month = px.bar(trend_month, x="MonthLabel", y="Value", title="Monthly MAL Value (Rs.)",
-                   text=trend_month["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
-                   color_discrete_sequence=["#1ABC9C"])
-fig_month.update_traces(textposition="outside")
-fig_month.update_layout(plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
-                        xaxis_title="", yaxis_title="Value (Rs.)",
-                        margin=dict(t=40,b=40), showlegend=False)
-st.plotly_chart(fig_month, use_container_width=True)
+tm = df.groupby(["Month","MonthLabel"])["Value"].sum().reset_index().sort_values("Month")
+fig = px.bar(tm, x="MonthLabel", y="Value", title="Monthly MAL Value (Rs.)",
+             text=tm["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
+             color_discrete_sequence=["#1ABC9C"])
+fig.update_traces(textposition="outside")
+fig.update_layout(**LAYOUT, xaxis_title="", yaxis_title="Value (Rs.)",
+                  margin=dict(t=40,b=40))
+st.plotly_chart(fig, use_container_width=True)
 
 c1, c2 = st.columns(2)
-trend_week = df.groupby(["YearWeek","WeekLabel"])["Value"].sum().reset_index().sort_values("YearWeek")
-fig_week = px.bar(trend_week, x="WeekLabel", y="Value", title="Week-wise MAL Value (Rs.)",
-                  text=trend_week["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
-                  color_discrete_sequence=["#3498DB"])
-fig_week.update_traces(textposition="outside")
-fig_week.update_layout(plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
-                       xaxis_title="", yaxis_title="Value (Rs.)",
-                       xaxis_tickangle=-45, margin=dict(t=40,b=60), showlegend=False)
-c1.plotly_chart(fig_week, use_container_width=True)
+tw = df.groupby(["YearWeek","WeekLabel"])["Value"].sum().reset_index().sort_values("YearWeek")
+fig = px.bar(tw, x="WeekLabel", y="Value", title="Week-wise MAL Value (Rs.)",
+             text=tw["Value"].apply(lambda v: f"Rs.{v:,.0f}"),
+             color_discrete_sequence=["#3498DB"])
+fig.update_traces(textposition="outside")
+fig.update_layout(**LAYOUT, xaxis_title="", yaxis_title="Value (Rs.)",
+                  xaxis_tickangle=-45, margin=dict(t=40,b=60))
+c1.plotly_chart(fig, use_container_width=True)
 
-trend_day = df.groupby("Date")["Value"].sum().reset_index().sort_values("Date")
-fig_day = px.bar(trend_day, x="Date", y="Value", title="Day-wise MAL Value (Rs.)",
-                 color_discrete_sequence=["#E74C3C"])
-fig_day.update_layout(plot_bgcolor="#FAFAFA", paper_bgcolor="#fff",
-                      xaxis_title="", yaxis_title="Value (Rs.)",
-                      xaxis_tickangle=-45, margin=dict(t=40,b=60), showlegend=False)
-c2.plotly_chart(fig_day, use_container_width=True)
+td = df.groupby("Date")["Value"].sum().reset_index().sort_values("Date")
+fig = px.bar(td, x="Date", y="Value", title="Day-wise MAL Value (Rs.)",
+             color_discrete_sequence=["#E74C3C"])
+fig.update_layout(**LAYOUT, xaxis_title="", yaxis_title="Value (Rs.)",
+                  xaxis_tickangle=-45, margin=dict(t=40,b=60))
+c2.plotly_chart(fig, use_container_width=True)
 
 # ── Party View ────────────────────────────────────────────────
 st.subheader("🏢 Party View")
 c1, c2 = st.columns(2)
-c1.plotly_chart(hbar_val("origin_party_id", "Origin Party by Value", "#E74C3C"), use_container_width=True)
-c2.plotly_chart(hbar_val("destination_party_id", "Destination Party by Value", "#E67E22"), use_container_width=True)
+c1.plotly_chart(hbar_val("origin_party_id",      "Origin Party by Value", "#E74C3C"), use_container_width=True)
+c2.plotly_chart(hbar_val("destination_party_id", "Dest Party by Value",   "#E67E22"), use_container_width=True)
 
 # ── Product View ───────────────────────────────────────────────
 st.subheader("📦 Product View")
@@ -265,12 +289,12 @@ c2.plotly_chart(hbar_qty("cms_vertical", "Vertical by Qty",         "#2ECC71"), 
 # ── Location View ──────────────────────────────────────────────
 st.subheader("📍 Location View")
 c1, c2, c3 = st.columns(3)
-c1.plotly_chart(hbar_val("DS City",     "DS City by Value",    "#8E44AD"), use_container_width=True)
-c2.plotly_chart(hbar_val("Zone",        "Zone by Value",       "#1ABC9C"), use_container_width=True)
-c3.plotly_chart(hbar_val("Store Name",  "Store by Value",      "#F39C12"), use_container_width=True)
+c1.plotly_chart(hbar_val("DS City",    "DS City by Value",   "#8E44AD"), use_container_width=True)
+c2.plotly_chart(hbar_val("Zone",       "Zone by Value",      "#1ABC9C"), use_container_width=True)
+c3.plotly_chart(hbar_val("Store Name", "Store by Value",     "#F39C12"), use_container_width=True)
 
 # ── Remark Split ───────────────────────────────────────────────
 st.subheader("🏷️ Remark Split")
 st.plotly_chart(pie_chart("Remark", "MAL by Remark Type"), use_container_width=True)
 
-st.caption(f"Forward MAL Dashboard · Streamlit · {len(df):,} records")
+st.caption(f"Forward MAL Dashboard · Streamlit Cloud · {len(df):,} records")
